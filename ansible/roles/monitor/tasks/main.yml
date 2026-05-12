@@ -1,0 +1,123 @@
+---
+- name: Wait for disk to be available
+  wait_for:
+    path: /dev/disk/by-id/google-monitor-data-disk
+    timeout: 30
+
+- name: Create partition if not exists
+  parted:
+    device: /dev/disk/by-id/google-monitor-data-disk
+    number: 1
+    state: present
+
+- name: Create XFS filesystem
+  filesystem:
+    fstype: xfs
+    dev: /dev/disk/by-id/google-monitor-data-disk
+
+- name: Create mount point
+  file:
+    path: /opt/monitor
+    state: directory
+
+- name: Mount monitor disk
+  mount:
+    path: /opt/monitor
+    src: /dev/disk/by-id/google-monitor-data-disk
+    fstype: xfs
+    state: mounted
+
+- name: Create monitoring subdirectories
+  file:
+    path: "/opt/monitor/{{ item }}"
+    state: directory
+    owner: "{{ '65534' if item == 'prometheus_data' else '472' if item == 'grafana' else 'root' }}"
+    mode: '0775'
+  loop:
+    - prometheus
+    - prometheus_data
+    - grafana
+
+- name: Configure Prometheus
+  copy:
+    dest: /opt/monitor/prometheus/prometheus.yml
+    content: |
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: 'node-exporter'
+          static_configs:
+            - targets: ['10.10.10.2:9100']
+
+- name: Install Docker repository
+  get_url:
+    url: https://download.docker.com/linux/centos/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+
+- name: Install Docker packages
+  dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+
+- name: Start and enable Docker
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Create docker-compose.yml
+  copy:
+    dest: /opt/monitor/docker-compose.yml
+    content: |
+      version: '3.8'
+      services:
+        prometheus:
+          image: prom/prometheus
+          volumes:
+            - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:Z
+            - ./prometheus_data:/prometheus:Z
+          network_mode: "host"
+          restart: always
+        grafana:
+          image: grafana/grafana
+          volumes:
+            - ./grafana:/var/lib/grafana:Z
+          network_mode: "host"
+          environment:
+            - GF_AUTH_ANONYMOUS_ENABLED=true
+            - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+          restart: always
+
+- name: Run Docker Compose
+  shell: docker compose up -d
+  args:
+    chdir: /opt/monitor
+
+- name: Allow Monitoring ports in firewalld
+  firewalld:
+    port: "{{ item }}"
+    permanent: yes
+    state: enabled
+    immediate: yes
+  loop:
+    - 9090/tcp
+    - 3000/tcp
+
+- name: Set SELinux context for data directories
+  sefcontext:
+    target: "/opt/monitor/{{ item }}(/.*)?"
+    setype: svirt_sandbox_file_t
+    state: present
+  loop:
+    - prometheus_data
+    - grafana
+
+- name: Apply SELinux context
+  command: "restorecon -Rv /opt/monitor/{{ item }}"
+  loop:
+    - prometheus_data
+    - grafana

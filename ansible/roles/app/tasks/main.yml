@@ -1,0 +1,60 @@
+---
+- name: Ensure tar and curl are installed
+  dnf:
+    name:
+      - tar
+      - curl
+    state: present
+
+- name: Create Node Exporter directory
+  file:
+    path: /tmp/node_exporter
+    state: directory
+
+- name: Download Node Exporter
+  get_url:
+    url: https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
+    dest: /tmp/node_exporter/node_exporter.tar.gz
+
+- name: Extract Node Exporter
+  unarchive:
+    src: /tmp/node_exporter/node_exporter.tar.gz
+    dest: /tmp/node_exporter
+    remote_src: yes
+
+- name: Copy Node Exporter binary
+  copy:
+    src: /tmp/node_exporter/node_exporter-1.7.0.linux-amd64/node_exporter
+    dest: /usr/local/bin/node_exporter
+    mode: '0755'
+    remote_src: yes
+
+- name: Create Node Exporter systemd service
+  copy:
+    dest: /etc/systemd/system/node_exporter.service
+    content: |
+      [Unit]
+      Description=Node Exporter
+      After=network.target
+      [Service]
+      Type=simple
+      User=root
+      ExecStart=/usr/local/bin/node_exporter
+      Restart=always
+      RestartSec=5
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable and start Node Exporter
+  systemd:
+    name: node_exporter
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+- name: Allow Node Exporter port in firewalld
+  firewalld:
+    port: 9100/tcp
+    permanent: yes
+    state: enabled
+    immediate: yes

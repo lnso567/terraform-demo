@@ -1,0 +1,12 @@
+---
+- name: Configure App Servers
+  hosts: role_app
+  become: yes
+  roles:
+    - app
+
+- name: Configure Monitoring Server
+  hosts: role_monitor
+  become: yes
+  roles:
+    - monitor

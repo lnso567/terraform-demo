@@ -1,0 +1,240 @@
+# ==============================================================================
+# GCP / SRE 實戰架構：Merged Best-Practice Edition (Bulletproof Version)
+# 特色：SELinux精確加固 + Firewalld規範 + Restart策略 + DNF鎖定防禦
+# ==============================================================================
+
+provider "google" {
+  project = "demoproject0417"
+  region  = "asia-east1"
+}
+
+# ── 1. 網絡層 ────────────────────────────────────────────────────────────────
+
+resource "google_compute_network" "mgmt_vpc" {
+  name                    = "mgmt-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "mgmt_subnet" {
+  name          = "mgmt-subnet"
+  ip_cidr_range = "10.10.10.0/24"
+  network       = google_compute_network.mgmt_vpc.id
+  region        = "asia-east1"
+}
+
+resource "google_compute_router" "router" {
+  name    = "mgmt-router"
+  region  = "asia-east1"
+  network = google_compute_network.mgmt_vpc.id
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "mgmt-nat"
+  router                             = google_compute_router.router.name
+  region                             = "asia-east1"
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+
+resource "google_compute_firewall" "allow_iap" {
+  name    = "allow-iap-ssh"
+  network = google_compute_network.mgmt_vpc.id
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "3000", "9090"]
+  }
+  source_ranges = ["35.235.240.0/20"]
+}
+
+resource "google_compute_firewall" "allow_monitoring_internal" {
+  name    = "allow-monitoring-internal"
+  network = google_compute_network.mgmt_vpc.id
+  allow {
+    protocol = "tcp"
+    ports    = ["9100"]
+  }
+  source_ranges = ["10.10.10.0/24"]
+}
+
+# ── 2. 持久化儲存 ────────────────────────────────────────────────────────────
+
+resource "google_compute_disk" "monitor_data" {
+  name = "monitor-data-disk"
+  type = "pd-balanced"
+  zone = "asia-east1-a"
+  size = 20
+}
+
+# ── 3A. 被監控端：tf-app-vm ──────────────────────────────────────────────────
+
+# 建立獨立的靜態內部 IP 資源，確保 IP 生命週期脫勾
+resource "google_compute_address" "app_vm_internal_ip" {
+  name         = "app-vm-internal-ip"
+  subnetwork   = google_compute_subnetwork.mgmt_subnet.id
+  address_type = "INTERNAL"
+  address      = "10.10.10.2"
+  region       = "asia-east1"
+}
+
+resource "google_compute_instance" "app_vm" {
+  name         = "tf-app-vm"
+  machine_type = "e2-micro"
+  zone         = "asia-east1-a"
+
+  boot_disk {
+    initialize_params { image = "rhel-cloud/rhel-9" }
+  }
+  network_interface {
+    network    = google_compute_network.mgmt_vpc.id
+    subnetwork = google_compute_subnetwork.mgmt_subnet.id
+    network_ip = google_compute_address.app_vm_internal_ip.address
+  }
+
+  metadata_startup_script = <<-EOT
+    #!/bin/bash
+    set -e
+
+    # [防彈升級版] 1. 循環等待 DNF 鎖定釋放
+    echo "Waiting for DNF locks to be released..."
+    while fuser /var/lib/dnf/last_makecache_lock >/dev/null 2>&1; do sleep 2; done
+
+    # 2. 增加重試機制的安裝 (防止網路抖動)
+    for i in {1..5}; do
+        dnf install -y tar curl && break || sleep 5
+    done
+
+    # 3. 確保路徑存在並執行下載
+    mkdir -p /tmp/node_exporter
+    cd /tmp/node_exporter
+    curl -LO https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
+    tar -xvf node_exporter-1.7.0.linux-amd64.tar.gz
+    
+    # 4. 強制覆蓋並賦權
+    cp node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+    chmod +x /usr/local/bin/node_exporter
+
+    # 5. 寫入服務文件
+    cat <<EOF > /etc/systemd/system/node_exporter.service
+[Unit]
+Description=Node Exporter
+After=network.target
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 6. 啟動服務
+    systemctl daemon-reload
+    systemctl enable --now node_exporter
+    
+    # 7. 防火牆放行 (不可讓步)
+    systemctl enable --now firewalld
+    firewall-cmd --permanent --add-port=9100/tcp
+    firewall-cmd --reload
+  EOT
+}
+
+# ── 3B. 監控主機：tf-monitor-vm ──────────────────────────────────────────────
+
+resource "google_compute_instance" "monitor_vm" {
+  name         = "tf-monitor-vm"
+  machine_type = "e2-medium"
+  zone         = "asia-east1-a"
+
+  boot_disk {
+    initialize_params { image = "rhel-cloud/rhel-9" }
+  }
+
+  attached_disk {
+    source      = google_compute_disk.monitor_data.id
+    device_name = "monitor-data-disk"
+    mode        = "READ_WRITE"
+  }
+
+  network_interface {
+    network    = google_compute_network.mgmt_vpc.id
+    subnetwork = google_compute_subnetwork.mgmt_subnet.id
+  }
+  service_account {
+    scopes = ["cloud-platform"]
+  }
+
+  metadata_startup_script = <<-EOT
+    #!/bin/bash
+    set -e
+
+    # 防火牆放行
+    systemctl enable --now firewalld
+    firewall-cmd --permanent --add-port=9090/tcp
+    firewall-cmd --permanent --add-port=3000/tcp
+    firewall-cmd --reload
+
+    # 磁碟掛載與時序控制
+    DEVICE_ID="/dev/disk/by-id/google-monitor-data-disk"
+    MOUNT_POINT="/opt/monitor"
+    while [ ! -b $DEVICE_ID ]; do sleep 2; done
+    if ! blkid $DEVICE_ID; then mkfs.xfs -f $DEVICE_ID; fi
+    mkdir -p $MOUNT_POINT
+    if ! mountpoint -q $MOUNT_POINT; then
+        mount -o discard,defaults $DEVICE_ID $MOUNT_POINT
+        echo "UUID=$(blkid -s UUID -o value $DEVICE_ID) $MOUNT_POINT xfs discard,defaults,nofail 0 2" >> /etc/fstab
+    fi
+
+    # 權限與 SELinux 穿透
+    mkdir -p $MOUNT_POINT/{prometheus,prometheus_data,grafana}
+    rm -f $MOUNT_POINT/prometheus_data/queries.active
+    chown -R 472:472 $MOUNT_POINT/grafana
+    chown -R 65534:65534 $MOUNT_POINT/prometheus_data
+    chmod -R 775 $MOUNT_POINT/grafana $MOUNT_POINT/prometheus_data
+    chcon -Rt svirt_sandbox_file_t $MOUNT_POINT/prometheus_data
+    chcon -Rt svirt_sandbox_file_t $MOUNT_POINT/grafana
+
+    cat <<'EOF' > $MOUNT_POINT/prometheus/prometheus.yml
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['10.10.10.2:9100']
+EOF
+
+    cat <<'EOF' > $MOUNT_POINT/docker-compose.yml
+version: '3.8'
+services:
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:Z
+      - ./prometheus_data:/prometheus:Z
+    network_mode: "host"
+    restart: always
+  grafana:
+    image: grafana/grafana
+    volumes:
+      - ./grafana:/var/lib/grafana:Z
+    network_mode: "host"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    restart: always
+EOF
+
+    # [同場加映防禦] 確保 Monitor VM 也不會因為 DNF 鎖定而無法安裝 Docker
+    echo "Waiting for DNF locks to be released..."
+    while fuser /var/lib/dnf/last_makecache_lock >/dev/null 2>&1; do sleep 2; done
+
+    for i in {1..5}; do
+        dnf config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo && \
+        dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin && \
+        break || sleep 5
+    done
+
+    systemctl enable --now docker
+    cd $MOUNT_POINT && docker compose up -d
+  EOT
+}

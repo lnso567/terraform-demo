@@ -1,0 +1,16 @@
+plugin: google.cloud.gcp_compute
+projects:
+  - demoproject0417
+zones:
+  - asia-east1-a
+filters: []
+auth_kind: application
+keyed_groups:
+  - key: labels['ansible-role']
+    separator: ""
+    prefix: role_
+hostnames:
+  - name
+compose:
+  # 強制使用 instance name 作為 ansible_host，配合 ansible.cfg 的 IAP ProxyCommand
+  ansible_host: name
