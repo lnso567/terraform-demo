@@ -100,7 +100,7 @@ resource "google_compute_instance_template" "app_template" {
   tags = ["http-server", "https-server", "allow-health-check"]
 
   disk {
-    source_image = "rhel-cloud/rhel-9"
+    source_image = "debian-cloud/debian-11"
     auto_delete  = true
     boot         = true
     disk_type    = "pd-balanced"
@@ -112,28 +112,24 @@ resource "google_compute_instance_template" "app_template" {
     subnetwork = google_compute_subnetwork.mgmt_subnet.id
   }
 
-  # Startup Script: 安裝 Docker + Nginx + node_exporter
+  # Startup Script: 安裝 Docker + Nginx + node_exporter (針對 Debian 改用 apt)
   metadata_startup_script = <<-EOT
  #!/bin/bash
  set -e
- set -o pipefail
  exec > >(tee /var/log/startup-script.log) 2>&1
 
- # 1. 安裝 Docker + 基礎工具
- dnf install -y dnf-utils
- dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
- dnf install -y docker-ce docker-ce-cli containerd.io firewalld
- systemctl enable --now docker
+ # 1. 安裝 Docker
+ apt-get update
+ apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+ curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+ apt-get update
+ apt-get install -y docker-ce docker-ce-cli containerd.io
 
- # 2. 配置防火牆規則 (開通 22, 80, 443, 9100, 3000, 9090)
- systemctl enable --now firewalld
- firewall-cmd --permanent --add-port={22,80,443,9100,3000,9090}/tcp
- firewall-cmd --reload
-
- # 3. 啟動 Nginx (供 Health Check 驗證)
+ # 2. 啟動 Nginx (供 Health Check 驗證)
  docker run -d --name nginx_web --restart always -p 80:80 nginx:alpine
 
- # 4. 啟動 node_exporter (延續監控)
+ # 3. 啟動 node_exporter
  docker run -d --name node_exporter --restart always \
  --net="host" --pid="host" \
  -v "/:/host:ro,rslave" \
