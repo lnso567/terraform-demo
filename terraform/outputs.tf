@@ -45,3 +45,8 @@ output "health_check_name" {
   description = "Health Check 名稱"
   value       = google_compute_health_check.app_hc.name
 }
+
+output "lb_ip" {
+  description = "全域負載平衡器靜態 IP"
+  value       = google_compute_global_address.lb_static_ip.address
+}

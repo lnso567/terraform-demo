@@ -10,9 +10,9 @@ resource "google_compute_network" "mgmt_vpc" {
 
 resource "google_compute_subnetwork" "mgmt_subnet" {
   name          = "mgmt-subnet"
-  ip_cidr_range = "10.10.10.0/24"
+  ip_cidr_range = "10.20.10.0/24"
   network       = google_compute_network.mgmt_vpc.id
-  region        = var.region
+  region        = var.region # Explicitly set region
 }
 
 resource "google_compute_router" "router" {
@@ -49,8 +49,8 @@ resource "google_compute_firewall" "allow_monitoring_internal" {
   source_ranges = ["10.10.10.0/24"]
 }
 
-# ── 1. 防火牆：允許 GCP Health Check ────────────────────────────────────────────
-# GCP Health Check 來自特定 IP 網段，必須放行否則 MIG 會認為機器永遠死
+# ── 1. 防火牆：安全加固 (僅允許 LB Proxy 與 Health Check) ──────────────────────────
+# 業界標準：不允許外部直接存取 VM，所有流量必須經過 LB
 resource "google_compute_firewall" "allow_health_check" {
   name        = "allow-gcp-health-check"
   network     = google_compute_network.mgmt_vpc.id
@@ -59,20 +59,8 @@ resource "google_compute_firewall" "allow_health_check" {
     protocol = "tcp"
     ports    = ["80", "443", "9100"] # Nginx (80/443) + node_exporter (9100)
   }
-  # GCP 官方 Health Check IP 網段
+  # GCP 官方 Health Check 與 LB Proxy IP 網段
   source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
-}
-
-# 增加外部訪問規則 (80/443)
-resource "google_compute_firewall" "allow_web" {
-  name    = "allow-public-web"
-  network = google_compute_network.mgmt_vpc.id
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "443"]
-  }
-  source_ranges = ["0.0.0.0/0"]
-  target_tags   = ["http-server", "https-server"]
 }
 
 # ── 2. Health Check 定義 ──────────────────────────────────────────────────────────
@@ -187,18 +175,70 @@ resource "google_compute_instance_group_manager" "app_mig" {
   }
 }
 
-# ── 5. Output：輸出 MIG 資訊 ────────────────────────────────────────────────────
-# output "mig_name" {
-#   description = "MIG 名稱"
-#   value       = google_compute_instance_group_manager.app_mig.name
-# }
-# 
-# output "mig_instance_count" {
-#   description = "MIG 實例數量"
-#   value       = google_compute_instance_group_manager.app_mig.target_size
-# }
-# 
-# output "health_check_name" {
-#   description = "Health Check 名稱"
-#   value       = google_compute_health_check.app_hc.name
-# }
+# ── 5. 全域負載平衡器 (Global External HTTP(S) LB) ──────────────────────────
+
+# 5.1 預留全域靜態 IP
+resource "google_compute_global_address" "lb_static_ip" {
+  name = "app-lb-static-ip"
+}
+
+# 5.2 Cloud Armor 安全政策 (基礎防護)
+resource "google_compute_security_policy" "lb_security_policy" {
+  name        = "app-lb-security-policy"
+  description = "Basic Cloud Armor policy"
+
+  rule {
+    action   = "allow"
+    priority = "2147483647"
+    match {
+      versioned_expr = "SRC_IPS_V1"
+      config {
+        src_ip_ranges = ["*"]
+      }
+    }
+    description = "Default rule, allows all traffic"
+  }
+}
+
+# 5.3 後端服務 (Backend Service)
+resource "google_compute_backend_service" "app_backend" {
+  name                  = "app-backend-service"
+  protocol              = "HTTP"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  timeout_sec           = 30
+  health_checks         = [google_compute_health_check.app_hc.id]
+  security_policy       = google_compute_security_policy.lb_security_policy.id
+
+  # 業界標準：連接排出 (Connection Draining)
+  connection_draining_timeout_sec = 300
+
+  backend {
+    group           = google_compute_instance_group_manager.app_mig.instance_group
+    balancing_mode  = "UTILIZATION"
+    capacity_scaler = 1.0
+  }
+
+  port_name = "http"
+}
+
+# 5.4 URL Map (路由定義)
+resource "google_compute_url_map" "app_url_map" {
+  name            = "app-url-map"
+  default_service = google_compute_backend_service.app_backend.id
+}
+
+# 5.5 Target HTTP Proxy
+resource "google_compute_target_http_proxy" "app_http_proxy" {
+  name    = "app-http-proxy"
+  url_map = google_compute_url_map.app_url_map.id
+}
+
+# 5.6 Global Forwarding Rule (流量入口)
+resource "google_compute_global_forwarding_rule" "app_forwarding_rule" {
+  name                  = "app-forwarding-rule"
+  ip_address            = google_compute_global_address.lb_static_ip.address
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  port_range            = "80"
+  target                = google_compute_target_http_proxy.app_http_proxy.id
+}

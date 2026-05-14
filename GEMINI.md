@@ -25,6 +25,17 @@ To ensure maximum performance and avoid resource bottlenecks during development 
 *   **Estimated Cost:** ~$327 USD / month.
 *   **Credit Status:** **Risky.** The $300 credit will be exhausted in ~28 days. Out-of-pocket charges will apply thereafter.
 
+## 🛡️ 安全性架構 (Security Architecture)
+
+### 1. Web 防護層 (WAF)
+*   **服務：** Google Cloud Armor。
+*   **原則：** 所有的 Web 流量必須經過全域負載平衡器 (GLB)，並受 Cloud Armor 政策保護。
+*   **擴充：** 若需更換為 Cloudflare，需調整 DNS 接管並在後端設定僅允許 Cloudflare IP 進入。
+
+### 2. 流量控制
+*   **入口控制：** 在 `terraform/main.tf` 中統一管理 `google_compute_security_policy`。
+*   **預設行為：** 實驗環境預設為全開放 (`0.0.0.0/0`)，生產環境建議改為白名單制。
+
 ---
 
 ## 🛠 Operational Rules
