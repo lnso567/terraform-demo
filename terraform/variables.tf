@@ -12,12 +12,12 @@ variable "region" {
 variable "zone" {
   description = "GCP Zone"
   type        = string
-  default     = "asia-east1-c"
+  default     = "asia-northeast1-a"
 }
 
 variable "app_machine_type" {
   type    = string
-  default = "e2-standard-4"
+  default = "e2-medium"
 }
 
 variable "monitor_machine_type" {
