@@ -25,3 +25,5 @@ The environment is designed for performance and reliability, utilizing the follo
 1.  **Provisioning**: `cd terraform && terraform init && terraform apply`
 2.  **Configuration**: `ansible-playbook -i ansible/inventory_gcp.yml ansible/playbook.yml`
 3.  **Cleanup**: `cd .. && ./destroy.sh`
+
+目前進度 DAY 9
